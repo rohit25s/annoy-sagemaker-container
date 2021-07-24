@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+
+
+from __future__ import print_function
+
+import json
+import sys
+import traceback
+import boto3
+from boto3.s3.transfer import TransferConfig
+
+from annoy import AnnoyIndex
+
+from annoy_helper import *
+
+
+
+# These are the paths to where SageMaker mounts interesting things in your container.
+
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+i_map = dict()
+training_params_map = dict()
+
+channel_name='training'
+training_path = os.path.join(input_path, channel_name)
+test_channel='test'
+test_path=os.path.join(input_path, test_channel)
+bucket = "data-test"
+
+# The function to execute the training.
+def train():
+    print('Starting the training.')
+    try:
+        # Read in any hyperparameters that the user passed with the training job
+        with open(param_path, 'r') as tc:
+            trainingParams = json.load(tc)
+
+        #Note that hyperparameters are always passed in as strings,
+        # so we need to do any necessary conversions.
+
+        no_of_trees = int(trainingParams.get('no_of_trees', 300))
+        feature_dim = int(trainingParams.get('feature_dim', 80))
+        metric = trainingParams.get('metric', 'angular')
+        nns = int(trainingParams.get('nns', 100))
+        on_disk = trainingParams.get('on_disk','True')
+        s3_output_path = trainingParams.get('output_path', None)
+        retrain = trainingParams.get('retrain', 'False')
+        search_by_vector = trainingParams.get('search_by_vector', False)
+        search_k = int(trainingParams.get('search_k', -1))
+        knn_all = trainingParams.get('knn_all', True)
+        model_name = trainingParams.get('model_name', 'None')
+        include_distances = trainingParams.get('include_distances', True)
+        
+        training_params_map['feature_dim'] = feature_dim
+        training_params_map['metric'] = metric
+        training_params_map['nns'] = nns
+        training_params_map['search_k'] = search_k
+        training_params_map['include_distances'] = include_distances
+        training_params_map['knn_all'] = knn_all
+        training_params_map['output_path'] = s3_output_path
+        training_params_map['search_by_vector'] = search_by_vector
+        
+        print("==============hyperparameters===============")
+        print("no_of_trees         : " + str(no_of_trees))
+        print("feature_dimension   : " + str(feature_dim))
+        print("metric              : " + str(metric))
+        print("nns                 : " + str(nns))
+        print("on_disk_build       : " + str(on_disk))
+        print("output_path         : " + str(s3_output_path))
+        print("retrain             : " + str(retrain))
+        print("search_by_vector    : " + str(search_by_vector))
+        print("include_distances   : " + str(include_distances))
+        print("knn_all             : " + str(knn_all))
+        print("search_k            : " + str(search_k))
+        print("model_name          : " + str(model_name))
+        print("=============================================")
+
+        if model_name == 'None':
+            cleanup()
+            print("model_name should be set in hyperparameters. Built Index would be stored at the location: s3://"
+                  + bucket + f"/annoy-knn/annoy_index/index_model_name.ann")
+            sys.exit(255)
+
+        if retrain == 'True':
+            files = [f for f in os.listdir(training_path) if f.endswith("parquet")]
+
+            print("{} parquet files found. Beginning reading...".format(len(files)), end="")
+            start = datetime.datetime.now()
+
+            df_list = [pd.read_parquet(os.path.join(training_path, f)) for f in files]
+            df = pd.concat(df_list, ignore_index=True)
+
+            end = datetime.datetime.now()
+            print(" Finished. Took {}".format(end-start))
+
+            train_data = df
+
+            print("dataframe data types: " + str(train_data.dtypes))
+            print("dataframe size: " + str(len(train_data)))
+
+            #we only need product_id and feature vector
+            train_data = train_data[['id', 'features']]
+
+
+            if on_disk == 'False':
+                build_annoy(train_data, feature_dim, metric, no_of_trees)
+            else:
+                on_disk_build_annoy(train_data, feature_dim, metric, no_of_trees)
+
+            s3 = boto3.client('s3')
+            # Set the desired multipart threshold value (5GB)
+            GB = 1024 ** 3
+            config = TransferConfig(multipart_threshold=5*GB)
+
+            index_path = os.path.join(model_path, "index.ann")
+            s3.upload_file(index_path, bucket, "annoy-knn/annoy_index/index_" + model_name + ".ann", Config=config)
+
+            i_map_path = os.path.join(model_path, "annoy-index-map.pkl")
+
+            with open(i_map_path, 'wb') as out:
+                pickle.dump(i_map, out)
+
+            s3.upload_file(i_map_path, bucket, "annoy-knn/product_id_map/annoy-index-map_" + model_name + ".pkl", Config=config)
+
+            training_params_map_path = os.path.join(model_path, "training-params-map.pkl")
+            with open(os.path.join(model_path, 'training-params-map.pkl'), 'wb') as out:
+                pickle.dump(training_params_map, out)
+                
+            s3.upload_file(training_params_map_path, bucket, "annoy-knn/training_params_map/training-params-map_" + model_name + ".pkl", Config=config)    
+
+            print('Training complete.')
+        else:
+            print('Using already completed training')
+
+            s3 = boto3.client('s3')
+            # Set the desired multipart threshold value (5GB)
+            GB = 1024 ** 3
+            config = TransferConfig(multipart_threshold=5*GB)
+
+            index_path = os.path.join(model_path, "index.ann")
+            s3.download_file(bucket, "annoy-knn/annoy_index/index_" + model_name + ".ann", index_path, Config=config)
+            i_map_path = os.path.join(model_path, "annoy-index-map.pkl")
+            s3.download_file(bucket, "annoy-knn/product_id_map/annoy-index-map_" + model_name + ".pkl", i_map_path, Config=config)
+
+            with open(os.path.join(model_path, 'training-params-map.pkl'), 'wb') as out:
+                pickle.dump(training_params_map, out)
+
+        print("going ahead with generating predictions")
+
+        helper = Ann()
+        helper.transformation()
+
+        # cleanup indexes
+        #cleanup()
+
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        #cleanup()
+        sys.exit(255)
+
+
+def on_disk_build_annoy(df, feature_dim, metric, no_of_trees):
+    print("on disk build")
+
+    start_time = datetime.datetime.now()
+    t = AnnoyIndex(feature_dim, metric)
+
+    index_path = os.path.join(model_path, "index.ann")
+
+    with open(index_path, 'w') as fp:
+        pass
+
+    t.on_disk_build(index_path)
+
+    i = 0
+    for row in df.iterrows():
+        t.add_item(i, row[1][1])
+        i_map[i] = row[1][0]
+        i = i + 1
+
+    print("items added: i:" + str(t.get_n_items()))
+    #build tree
+    t.build(no_of_trees)
+
+    build_time = datetime.datetime.now() - start_time
+
+    b = os.path.getsize(index_path)
+    print("saved on disk, file path: " + index_path + " fileSize in MB:" + str(b/(1024*1024)) + "  build time: " + str(build_time))
+
+
+def build_annoy(df, feature_dim, metric, no_of_trees):
+    print("on RAM build")
+    start_time = datetime.datetime.now()
+    t = AnnoyIndex(feature_dim, metric)
+
+    i = 0
+    for row in df.iterrows():
+        t.add_item(i, row[1][1])
+        i_map[i] = row[1][0]
+        i = i + 1
+
+    #build tree
+    t.build(no_of_trees)
+
+    #save index
+    index_path = os.path.join(model_path, "index.ann")
+
+    with open(index_path, 'w') as fp:
+        pass
+
+    saved = t.save(index_path)
+    build_time = datetime.datetime.now() - start_time()
+    b = os.path.getsize(index_path)
+    if saved:
+        print("file path: " + index_path + " fileSize in MB:" + str(b/(1024*1024)) + "  build time: " + str(build_time))
+
+
+def cleanup():
+    index_path = os.path.join(model_path, "index.ann")
+    if os.path.isfile(index_path):
+        os.remove(myfile)
+    else:
+        print("Error: %s file not found" % index_path)
+    i_map_path = os.path.join(model_path, "annoy-index-map.pkl")
+    if os.path.isfile(i_map_path):
+        os.remove(i_map_path)
+    else:
+        print("Error: %s file not found" % i_map_path)    
+
+
+if __name__ == '__main__':
+    train()
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
+
